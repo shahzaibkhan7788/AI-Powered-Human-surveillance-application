@@ -3,6 +3,7 @@
 This repository contains an updated SPARTA pipeline for pose-based anomaly detection on surveillance videos. It builds on the original SPARTA architecture from [TeCSAR-UNCC/SPARTA](https://github.com/TeCSAR-UNCC/SPARTA), which trains the shared encoder plus the twin decoders (CTD/FTD) on multiple datasets; this fork focuses on streamlined multi-person inference and tooling.
 
 It includes:
+
 - The SPARTA model code (`models.py`, `main.py`, `utils/`)
 - Pretrained checkpoints for multiple datasets (`Trained_Models/`)
 - End-to-end single-video inference with multi-person tracking (`inference_sparta_vit.py`)
@@ -14,12 +15,15 @@ It includes:
 SPARTA uses human pose sequences instead of raw RGB pixels to detect anomalies.
 
 Core model idea:
+
 - A shared encoder
 - Two decoders:
+
 1. `CTD` (Current Target Decoder): reconstructs current pose sequence
 2. `FTD` (Future Target Decoder): predicts future pose sequence
 
 At inference time, anomaly score is based on reconstruction/prediction error:
+
 - `score_mode=ctd`: only CTD
 - `score_mode=ftd`: only FTD
 - `score_mode=both`: fused CTD + FTD score
@@ -53,32 +57,107 @@ Key files and folders:
     └── NWPUC/
 ```
 
-## 3) Model Weights (Google Drive)
+## 3) Model Weights and Download Policy
 
-Paste your Drive link here:
+This repository does not include large model or pose weight files on GitHub. Instead, download the required weights separately and place them in the correct local paths before running inference.
 
-- `Weights Link`: `<PASTE_YOUR_GOOGLE_DRIVE_LINK_HERE>`
+### Weight categories
 
-Expected local checkpoint layout:
+1. Detection weights (YOLOv8 / YOLOv26-based pose detector)
+   - `yolov8n.pt`, `yolov8s.pt`, `yolov8m.pt`, `yolov8l.pt`, `yolov8x.pt`
+   - `yolo26n-pose.pt`, `yolo26s-pose.pt`, `yolo26m-pose.pt`, `yolo26l-pose.pt`, `yolo26x-pose.pt`
+
+2. Pose estimation weights
+   - ViTPose:
+     - `td-hm_ViTPose-small_8xb64-210e_coco-256x192-62d7a712_20230314.pth`
+     - `td-hm_ViTPose-base_8xb64-210e_coco-256x192-216eae50_20230314.pth`
+     - `td-hm_ViTPose-large_8xb64-210e_coco-256x192-53609f55_20230314.pth`
+   - RTM pose:
+     - `rtmpose-l_simcc-coco_pt-aic-coco_420e-256x192-1352a4d2_20230127.pth`
+
+3. SPARTA checkpoints
+   - `results-sparta-c/checkpoint_best.pth.tar`
+   - `results-sparta-f/checkpoint_best.pth.tar`
+
+4. Optional pose detector checkpoint for YOLO-pose
+   - `yolo26n-pose.pt`, `yolo26s-pose.pt`, `yolo26m-pose.pt`, `yolo26l-pose.pt`, `yolo26x-pose.pt`
+
+### Where to store weights
+
+A common layout is:
 
 ```text
-Trained_Models/
-  SHT/
-    CTD.pth.tar
-    FTD.pth.tar
-  CHAD/
-    CTD.pth.tar
-    FTD.pth.tar
-  NWPUC/
-    CTD.pth.tar
-    FTD.pth.tar
+PoseEstimationModel/
+  td-hm_ViTPose-small_8xb64-210e_coco-256x192-62d7a712_20230314.pth
+  td-hm_ViTPose-base_8xb64-210e_coco-256x192-216eae50_20230314.pth
+  td-hm_ViTPose-large_8xb64-210e_coco-256x192-53609f55_20230314.pth
+  yolo26n-pose.pt
+  yolo26s-pose.pt
+  yolo26m-pose.pt
+  yolo26l-pose.pt
+  yolo26x-pose.pt
+  rtmpose-l_simcc-coco_pt-aic-coco_420e-256x192-1352a4d2_20230127.pth
+results-sparta-c/checkpoint_best.pth.tar
+results-sparta-f/checkpoint_best.pth.tar
 ```
 
-You can select which dataset weights to use by passing:
-- `--ctd_path`
-- `--ftd_path`
+### Example config weight block
 
-## 4) Environment Setup
+```yaml
+models:
+  detection:
+    weights:
+      yolo:
+        n: "yolov8n.pt"
+        s: "yolov8s.pt"
+        m: "yolov8m.pt"
+        l: "yolov8l.pt"
+        x: "yolov8x.pt"
+  pose:
+    weights:
+      vitpose:
+        small:
+          checkpoint: "./td-hm_ViTPose-small_8xb64-210e_coco-256x192-62d7a712_20230314.pth"
+      yolo-pose:
+        n: "./yolo26n-pose.pt"
+        s: "./yolo26s-pose.pt"
+        m: "./yolo26m-pose.pt"
+        l: "./yolo26l-pose.pt"
+        x: "./yolo26x-pose.pt"
+  sparta:
+    checkpoints:
+      sparta_c: "results-sparta-c/checkpoint_best.pth.tar"
+      sparta_f: "results-sparta-f/checkpoint_best.pth.tar"
+```
+
+### IITB-Corridor Dataset and SPARTA training
+
+The pipeline was trained and evaluated on the IITB-Corridor Dataset. The SPARTA checkpoints for `sparta_c` and `sparta_h_c` are provided in drive links rather than in the repository.
+
+- `sparta_c`: `results-sparta-c/checkpoint_best.pth.tar`
+- `sparta_h_c`: `results-sparta-c/checkpoint_best.pth.tar`
+
+### Download links
+
+Put your Google Drive or external download links here:
+
+- `Detection + pose model weights`: `<YOUR_DETECTION_AND_POSE_WEIGHTS_DRIVE_LINK>`
+- `SPARTA checkpoint weights`: `<YOUR_SPARTA_CHECKPOINTS_DRIVE_LINK>`
+
+> Note: Do not commit these large weight files to GitHub. Keep only code and configuration in the repo.
+
+## 4) Project Steps and Full Pipeline
+
+Follow these steps to run the whole project from detection to anomaly inference.
+
+1. Install dependencies.
+2. Download required model weights and checkpoints from the provided drive links.
+3. Place weights in the repository or update paths in config files.
+4. Run person detection / pose estimation.
+5. Run SPARTA inference on pose sequences.
+6. Save and inspect output videos and evaluation results.
+
+### Step 1: Environment setup
 
 If you already created `sparta-venv`, use:
 
@@ -87,10 +166,78 @@ CONDA_NO_PLUGINS=true conda run -n sparta-venv env PYTHONNOUSERSITE=1 \
 python -m pip install -r requirements.txt
 ```
 
+If you do not have a conda environment yet, create one:
+
+```bash
+conda create -n sparta-venv python=3.10 -y
+conda activate sparta-venv
+python -m pip install -r requirements.txt
+```
+
 Optional dependencies:
+
 - `tensorboard` (needed by `utils/train_utils.py` imports)
 - `matplotlib` (for `inference_with_graph.py`)
 - `mmpose` + `mmcv` (only if you want ViTPose instead of YOLO-pose fallback)
+
+### Step 2: Download required weights
+
+Download the following model weights from the shared links:
+
+- YOLO detection weights (for object detection or pose-based detection)
+- YOLO-pose weights (`yolo26*.pt`) for pose estimation in the pipeline
+- ViTPose weights for pose estimation if you want the ViTPose option
+- SPARTA checkpoints for `sparta_c` and `sparta_h_c`
+
+Place the downloaded files in the repository and update the paths in your config file or command line.
+
+### Step 3: Configure your paths
+
+Edit `PoseEstimationModel/config.yaml` or your local config to point to the downloaded files. Example:
+
+```yaml
+models:
+  detection:
+    weights:
+      yolo:
+        n: "yolov8n.pt"
+  pose:
+    weights:
+      vitpose:
+        small:
+          checkpoint: "./td-hm_ViTPose-small_8xb64-210e_coco-256x192-62d7a712_20230314.pth"
+      yolo-pose:
+        n: "./yolo26n-pose.pt"
+  sparta:
+    checkpoints:
+      sparta_c: "results-sparta-c/checkpoint_best.pth.tar"
+      sparta_f: "results-sparta-f/checkpoint_best.pth.tar"
+```
+
+### Step 4: Run detection and pose estimation
+
+For the full pipeline, use the main inference entry point with the downloaded detection + pose weights.
+
+Example:
+
+```bash
+conda activate sparta-venv
+python inference_sparta_vit.py \
+  --video_path "/absolute/path/to/video.mp4" \
+  --yolo_model "yolo26x-pose.pt" \
+  --ctd_path "results-sparta-c/checkpoint_best.pth.tar" \
+  --ftd_path "results-sparta-f/checkpoint_best.pth.tar" \
+  --score_mode both \
+  --device cpu
+```
+
+### Step 5: Inspect outputs
+
+The pipeline writes pose outputs and SPARTA evaluation results to configured output directories. Review:
+
+- `pose_outputs/`
+- `evaluation_results_sparta/`
+- generated annotated video files
 
 ## 5) Quick Start: Run On One Video
 
@@ -113,6 +260,7 @@ python inference_sparta_vit.py \
 ```
 
 Output:
+
 - Annotated video with person IDs, skeletons, and anomaly scores.
 
 ## 6) How Inference Works
@@ -148,16 +296,19 @@ Output:
 Important: pretrained checkpoints do not store a ready-to-use inference threshold.
 
 What is stored:
+
 - model weights (`state_dict`)
 - optimizer state
 - training args
 
 What is not stored:
+
 - per-dataset final threshold like `eer_th` or inference cutoff
 
 In this codebase, thresholds are computed during evaluation from ground-truth masks (`utils/eval.py`), not embedded in weights.
 
 Recommended strategy for deployment:
+
 1. Use adaptive threshold mode for quick testing.
 2. For production, compute dataset/camera-specific threshold on a validation set and pass it with `--anomaly_threshold`.
 
@@ -178,10 +329,12 @@ If normal actions (like sitting) appear anomalous:
 ## 10) Head/Shoulder Skeleton Connectivity
 
 Head to shoulder links are included in updated skeleton drawing:
+
 - `(3, 5)` (left ear to left shoulder)
 - `(4, 6)` (right ear to right shoulder)
 
 Implemented in:
+
 - `inference_sparta_vit.py`
 - `PoseEstimationModel/02_estimate_pose_vit.py`
 - `PoseEstimationModel/pose_estimate.py`
@@ -202,13 +355,14 @@ python inference_with_graph.py \
 ```
 
 Outputs:
+
 - annotated video
 - graph image (frame index vs anomaly score)
-
 
 A sample inference output is shown below (CHAD weights, YOLOv26 pose detector):
 
 **Video Details:**
+
 - Source: Surveillance footage (3+ people)  
 - Duration: ~25 seconds
 - Features:
@@ -219,6 +373,7 @@ A sample inference output is shown below (CHAD weights, YOLOv26 pose detector):
 **📹 View Demo Video:** [Download from Google Drive](https://drive.google.com/file/d/1l0F1Jl8mFm03Nw0wmPvEXzs1wnXM2POf/view?usp=sharing)
   
 **To generate your own demo:**
+
 ```bash
 python inference_sparta_vit.py \
   --video_path "your_video.mp4" \
