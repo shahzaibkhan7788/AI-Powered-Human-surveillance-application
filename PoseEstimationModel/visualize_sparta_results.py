@@ -6,7 +6,7 @@ import os
 from tqdm import tqdm
 
 # --- Configuration ---
-VIDEO_PATH = r"C:\Users\Shahzaib\OneDrive\Desktop\PoseEstimationModel\SPARTA\PoseEstimationModel\Surveillance video shows fight between families in murder case.mp4"
+VIDEO_PATH = r"/home/waleed64/Documents/Human_Centric_Anomaly_Detection_Agent/videos/surveillance video.mp4"
 JSON_PATH = "fighting_vit_poses.json"
 RESULTS_CSV = "anomaly_fighting_results.csv"
 OUTPUT_VIDEO = "fighting_sparta_visualized.avi"

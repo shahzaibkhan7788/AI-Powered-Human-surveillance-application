@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 import random
 import re
+import sys
 
 os.environ.setdefault("YOLO_CONFIG_DIR", "/tmp")
 os.environ.setdefault("ULTRALYTICS_CONFIG_DIR", "/tmp")
@@ -541,13 +542,16 @@ class PosePipeline:
     def __init__(self, config_path: Optional[str] = None):
         self.config = Config(config_path)
         self.paths = self.config.resolved_paths()
+        self.last_anomaly_records: List[Dict[str, Any]] = []
+        self.last_pose_json_path: Optional[Path] = None
 
     # Inside PosePipeline class in pose_estimation.py
 
     def run_live(self):
         """
-        Generator that yields processed frames with detection, tracking, and pose estimation
-        all happening in a single pass per frame.
+        Generator that yields processed frames with detection, tracking, pose estimation,
+        and real-time SPARTA anomaly detection all happening in parallel.
+        Uses rolling keypoint buffers for each person to enable live SPARTA inference.
         """
         p = self.paths
         cap = cv2.VideoCapture(str(p["input_video"]))
@@ -570,8 +574,99 @@ class PosePipeline:
         else:
             estimator = MMPoseTopDownEstimator(self.config, pose_paths)
         
+        # --- SPARTA Anomaly Detection Setup ---
+        try:
+            from utils.tokenizer import Tokenizer
+            from models import SPARTA_C, SPARTA_F, SPARTA_H
+            from utils.train_utils import CostumLoss
+            
+            sparta_cfg = self.config.cfg.get("models", {}).get("sparta", {})
+            seg_len = int(sparta_cfg.get("seg_len", 24))
+            num_kp = int(sparta_cfg.get("num_kp", 18))
+            relative = bool(sparta_cfg.get("relative", True))
+            device = self.config.pose_cfg.get("device", "cpu")
+            
+            sparta_branch = sparta_cfg.get("branch", "SPARTA_C")
+            friendly_branch_map = {
+                "Reconstruction Model": "SPARTA_C",
+                "Future trajectory prediction model": "SPARTA_F",
+                "Hybrid": "SPARTA_H",
+            }
+            sparta_branch = friendly_branch_map.get(sparta_branch, sparta_branch)
+            
+            ckpt_c = sparta_cfg.get("checkpoints", {}).get("sparta_c") or ""
+            ckpt_f = sparta_cfg.get("checkpoints", {}).get("sparta_f") or ""
+            ckpt_h_c = sparta_cfg.get("checkpoints", {}).get("sparta_h_c") or ckpt_c
+            ckpt_h_f = sparta_cfg.get("checkpoints", {}).get("sparta_h_f") or ckpt_f
+            th_c = float(sparta_cfg.get("checkpoints", {}).get("eer_threshold_c", 0.5))
+            th_f = float(sparta_cfg.get("checkpoints", {}).get("eer_threshold_f", 0.5))
+            th_h = float(sparta_cfg.get("checkpoints", {}).get("eer_threshold_h", max(th_c, th_f)))
+            
+            # Build SPARTA model
+            expand_ratio = 2 if relative else 1
+            input_dim = num_kp * 2
+            num_heads = int(sparta_cfg.get("model_num_heads", 2))
+            latent_dim = int(sparta_cfg.get("model_latent_dim", 64))
+            dropout = float(sparta_cfg.get("dropout", 0.3))
+            
+            if sparta_branch == "SPARTA_C":
+                sparta_model = SPARTA_C(input_dim * expand_ratio, num_heads, latent_dim, 4, 1000, device=device, dropout=dropout)
+                if ckpt_c and Path(ckpt_c).exists():
+                    ckpt = torch.load(ckpt_c, map_location=device)
+                    sparta_model.load_state_dict(ckpt['state_dict'])
+                    print(f"[SPARTA] Loaded SPARTA_C from {ckpt_c}")
+                sparta_model.to(device)
+                sparta_model.eval()
+                sparta_threshold = th_c
+                sparta_tokenizer = Tokenizer(Namespace(branch="SPARTA_C", device=device, relative=relative, token_config="t", traj=False, num_kp=num_kp))
+                loss_func = CostumLoss("MSE", a=1, b=1, c=1, d=1)
+            elif sparta_branch == "SPARTA_F":
+                sparta_model = SPARTA_F(input_dim * expand_ratio, num_heads, latent_dim, 4, 1000, device=device)
+                if ckpt_f and Path(ckpt_f).exists():
+                    ckpt = torch.load(ckpt_f, map_location=device)
+                    sparta_model.load_state_dict(ckpt['state_dict'])
+                    print(f"[SPARTA] Loaded SPARTA_F from {ckpt_f}")
+                sparta_model.to(device)
+                sparta_model.eval()
+                sparta_threshold = th_f
+                sparta_tokenizer = Tokenizer(Namespace(branch="SPARTA_F", device=device, relative=relative, token_config="t", traj=False, num_kp=num_kp))
+                loss_func = CostumLoss("MSE", a=1, b=1, c=1, d=1)
+            elif sparta_branch == "SPARTA_H":
+                sparta_model = SPARTA_H(input_dim * expand_ratio, num_heads, latent_dim, 4, 1000, device=device, dropout=dropout)
+                if ckpt_h_c and Path(ckpt_h_c).exists():
+                    ckpt = torch.load(ckpt_h_c, map_location=device)
+                    sparta_model.CTD.load_state_dict(ckpt['state_dict'])
+                    print(f"[SPARTA] Loaded SPARTA_H CTD from {ckpt_h_c}")
+                if ckpt_h_f and Path(ckpt_h_f).exists():
+                    ckpt = torch.load(ckpt_h_f, map_location=device)
+                    sparta_model.FTD.load_state_dict(ckpt['state_dict'])
+                    print(f"[SPARTA] Loaded SPARTA_H FTD from {ckpt_h_f}")
+                sparta_model.to(device)
+                sparta_model.eval()
+                sparta_threshold = th_h
+                sparta_tokenizer = Tokenizer(Namespace(branch="SPARTA_H", device=device, relative=relative, token_config="t", traj=False, num_kp=num_kp))
+                loss_func = CostumLoss("MSE", a=1, b=1, c=1, d=1)
+            else:
+                sparta_model = None
+                sparta_tokenizer = None
+                sparta_threshold = 0.5
+                loss_func = None
+            
+            sparta_enabled = sparta_model is not None
+        except Exception as e:
+            print(f"[WARNING] SPARTA loading failed: {e}. Proceeding without anomaly detection.")
+            sparta_enabled = False
+            sparta_model = None
+            sparta_tokenizer = None
+        
         frame_id = 0
         sparta_json = defaultdict(dict)
+        self.last_anomaly_records = []
+        self.last_pose_json_path = None
+        
+        # Rolling buffers: per-person keypoint sequences for SPARTA
+        per_person_kpts = defaultdict(list)  # {person_id: [(frame_id, keypoints_array), ...]}
+        per_person_anomaly = defaultdict(lambda: defaultdict(lambda: 0))  # {person_id: {frame_id: 0/1}}
         
         with tqdm(total=total_frames, desc="Processing") as pbar:
             while True:
@@ -599,7 +694,7 @@ class PosePipeline:
                 # Update tracker with detected boxes
                 tracks = tracker.update(boxes, frame)
                 
-                # --- STEP 2: Pose Estimation & Visualization (unified) ---
+                # --- STEP 2: Pose Estimation ---
                 for t in tracks:
                     if len(t) >= 5:
                         x1, y1, x2, y2 = t[:4]
@@ -614,23 +709,84 @@ class PosePipeline:
                             pose = estimator._estimate(frame, bbox)
                         
                         if pose and pose.get("mean", 0) >= estimator.conf_threshold:
-                            # Store keypoints and draw on frame
+                            # Store keypoints
                             flat = [c for trip in pose["keypoints"] for c in trip]
                             sparta_json[str(track_id)][str(frame_id)] = {
                                 "keypoints": flat,
                                 "scores": float(pose["mean"])
                             }
                             
-                            # Draw skeleton, pose, bounding box, and track ID
+                            anomaly_score = 0.0
+                            pred = 0
+                            # --- STEP 3: SPARTA Anomaly Detection (rolling buffer) ---
+                            if sparta_enabled and len(pose["keypoints"]) > 0:
+                                kpts_array = np.array([k[:2] for k in pose["keypoints"]], dtype=np.float32)  # (num_kp, 2)
+                                per_person_kpts[track_id].append((frame_id, kpts_array))
+                                
+                                # Keep only recent seg_len frames
+                                if len(per_person_kpts[track_id]) > seg_len + 10:
+                                    per_person_kpts[track_id] = per_person_kpts[track_id][-(seg_len + 5):]
+                                
+                                # Run SPARTA inference when buffer has at least seg_len frames
+                                if len(per_person_kpts[track_id]) >= seg_len:
+                                    # Prepare batch data from recent seg_len frames
+                                    recent_frames = per_person_kpts[track_id][-seg_len:]
+                                    batch_kpts = np.array([kpt_arr for _, kpt_arr in recent_frames], dtype=np.float32)  # (seg_len, num_kp, 2)
+                                    
+                                    # Handle relative coordinates if enabled
+                                    if relative and len(batch_kpts) > 1:
+                                        abs_kpts = batch_kpts.copy()
+                                        rel_kpts = batch_kpts.copy()
+                                        for t_ in range(1, len(batch_kpts)):
+                                            rel_kpts[t_] = batch_kpts[t_] - batch_kpts[t_ - 1]
+                                        batch_kpts = np.concatenate([abs_kpts, rel_kpts], axis=1)  # (seg_len, num_kp*2, 2)
+                                    
+                                    # Convert to tensor: (1, channels=2, seg_len, num_kp)
+                                    kpts_tensor = torch.from_numpy(batch_kpts.transpose(2, 0, 1)).unsqueeze(0).to(device, dtype=torch.float32)
+                                    
+                                    try:
+                                        with torch.no_grad():
+                                            if sparta_branch == "SPARTA_C":
+                                                recon = sparta_model.forward(kpts_tensor, kpts_tensor)
+                                                loss = loss_func.calculate(kpts_tensor, recon)
+                                            elif sparta_branch == "SPARTA_F":
+                                                pred = sparta_model.forward(kpts_tensor, kpts_tensor)
+                                                loss = loss_func.calculate(kpts_tensor, pred)
+                                            else:  # SPARTA_H
+                                                ctd_out, ftd_out = sparta_model.forward(kpts_tensor, kpts_tensor)
+                                                loss_c = loss_func.calculate(kpts_tensor, ctd_out)
+                                                loss_f = loss_func.calculate(kpts_tensor, ftd_out)
+                                                loss = (loss_c + loss_f) * 0.5
+                                            
+                                            anomaly_score = float(loss.cpu().numpy())
+                                            pred = 1 if anomaly_score > sparta_threshold else 0
+                                            
+                                            # Store prediction for the most recent frame in the buffer
+                                            most_recent_fid = recent_frames[-1][0]
+                                            per_person_anomaly[track_id][most_recent_fid] = pred
+                                    except Exception as e:
+                                        print(f"[SPARTA] Inference error for person {track_id}: {e}")
+                            
+                            # Save record for this person/frame
+                            self.last_anomaly_records.append({
+                                "frame_id": frame_id,
+                                "person_id": track_id,
+                                "anomaly_score": anomaly_score,
+                                "anomaly_pred": int(pred),
+                            })
+                            
+                            # --- STEP 4: Visualization with anomaly coloring ---
+                            anomaly_pred = per_person_anomaly[track_id].get(frame_id, 0)
                             frame = self._draw_pose_on_frame(
                                 frame,
                                 pose,
                                 estimator,
                                 bbox=bbox,
                                 track_id=track_id,
+                                is_anomaly=(anomaly_pred == 1),
                             )
                 
-                # --- STEP 3: Yield processed frame to Streamlit ---
+                # --- STEP 5: Yield processed frame to Streamlit ---
                 yield frame, frame_id, total_frames
                 frame_id += 1
                 pbar.update(1)
@@ -644,6 +800,7 @@ class PosePipeline:
         with open(final_path, "w") as f:
             json.dump(sparta_json, f, indent=2)
         
+        self.last_pose_json_path = final_path
         return final_path
 
     def _estimate_yolo_pose(self, estimator, frame, bbox):
@@ -696,9 +853,14 @@ class PosePipeline:
         triplets = [[float(x), float(y), float(c)] for (x, y), c in zip(kps, confs)]
         return {"keypoints": triplets, "mean": float(confs.mean())}
 
-    def _draw_pose_on_frame(self, frame, pose, estimator, bbox: Optional[list[float]] = None, track_id: Optional[int] = None):
-        """Draw skeleton, keypoints, bounding box, and ID on frame."""
-        color = estimator._vis_color if hasattr(estimator, '_vis_color') else (0, 255, 0)
+    def _draw_pose_on_frame(self, frame, pose, estimator, bbox: Optional[list[float]] = None, track_id: Optional[int] = None, is_anomaly: bool = False):
+        """Draw skeleton, keypoints, bounding box, and ID on frame. Red color if anomaly detected."""
+        # Use red if anomaly, otherwise use estimator color
+        if is_anomaly:
+            color = (0, 0, 255)  # Red in BGR
+        else:
+            color = estimator._vis_color if hasattr(estimator, '_vis_color') else (0, 255, 0)
+        
         kpts = pose["keypoints"]
         min_kpt_conf = estimator.min_kpt_conf if hasattr(estimator, 'min_kpt_conf') else 0.3
         line_thickness = max(1, estimator._vis_line_thickness if hasattr(estimator, '_vis_line_thickness') else 2)
@@ -725,6 +887,13 @@ class PosePipeline:
                 text_pos = (x1, max(y1 - 6, 12))
                 cv2.putText(frame, label, text_pos, cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 0), 2, lineType=cv2.LINE_AA)
                 cv2.putText(frame, label, text_pos, cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1, lineType=cv2.LINE_AA)
+                
+                # Add anomaly indicator if detected
+                if is_anomaly:
+                    anomaly_label = "ANOMALY"
+                    anomaly_pos = (x1, max(y1 - 20, 12))
+                    cv2.putText(frame, anomaly_label, anomaly_pos, cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 0, 0), 2, lineType=cv2.LINE_AA)
+                    cv2.putText(frame, anomaly_label, anomaly_pos, cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 0, 255), 1, lineType=cv2.LINE_AA)
         
         return frame
 
