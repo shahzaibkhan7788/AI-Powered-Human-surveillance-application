@@ -57,9 +57,53 @@ def save_upload(upload) -> Path:
 
 def camera_available(index: int = 0) -> bool:
     cap = cv2.VideoCapture(index)
-    ok = cap.isOpened()
+    if not cap.isOpened():
+        cap.release()
+        return False
+    ok, _ = cap.read()
     cap.release()
     return bool(ok)
+
+
+def select_score_x_column(df: pd.DataFrame) -> str:
+    for candidate in ("timeline_index", "start_frame", "frame_id", "segment"):
+        if candidate in df.columns:
+            return candidate
+    return df.columns[0]
+
+
+def build_person_score_figure(df: pd.DataFrame, threshold: float | None = None):
+    import matplotlib.pyplot as plt
+
+    frame = df.copy()
+    if "person_id" in frame.columns:
+        frame["person_id"] = frame["person_id"].astype(str)
+    else:
+        frame["person_id"] = "unknown"
+    x_col = select_score_x_column(frame)
+    if "score" not in frame.columns:
+        score_col = [c for c in frame.columns if c not in {"person_id", x_col}][-1]
+        frame = frame.rename(columns={score_col: "score"})
+    frame[x_col] = pd.to_numeric(frame[x_col], errors="coerce")
+    frame["score"] = pd.to_numeric(frame["score"], errors="coerce")
+    frame = frame.dropna(subset=[x_col, "score"]).sort_values(["person_id", x_col])
+
+    fig, ax = plt.subplots(figsize=(12, 5))
+    for person_id, group in frame.groupby("person_id"):
+        ax.plot(group[x_col], group["score"], marker='o', linewidth=1.8, markersize=3.5, label=f"ID {person_id}")
+        if "predicted" in group.columns:
+            anomaly_points = group[group["predicted"].astype(str).isin(["1", "1.0", "True", "true"])]
+            if not anomaly_points.empty:
+                ax.scatter(anomaly_points[x_col], anomaly_points["score"], color='red', s=28, marker='D', zorder=5)
+    if threshold is not None:
+        ax.axhline(float(threshold), color='red', linestyle='--', linewidth=1.3, label=f"Threshold {float(threshold):.3f}")
+    ax.set_title("Human-Centric Anomaly Scores Over Time")
+    ax.set_xlabel(x_col.replace("_", " ").title())
+    ax.set_ylabel("Anomaly Score")
+    ax.grid(True, linestyle='--', alpha=0.35)
+    ax.legend(loc='upper right', fontsize='small', ncol=2)
+    fig.tight_layout()
+    return fig
 
 
 def get_expected_name(stem: str, prefix: str) -> str:
@@ -472,10 +516,53 @@ def main():
                     scores_files = sorted(scores_dir.glob("*.csv"), key=lambda p: p.stat().st_mtime, reverse=True)
                     
                     if scores_files:
-                        df = pd.read_csv(scores_files[0])
-                        score_col = "score" if "score" in df.columns else df.columns[-1]
-                        st.line_chart(df[score_col], height=300)
-                        st.success(f"✅ Scores: {scores_files[0].name}")
+                        scores_path = scores_files[0]
+                        df = pd.read_csv(scores_path)
+                        threshold_line = None
+                        if sparta_branch == "SPARTA_C":
+                            threshold_line = th_c
+                        elif sparta_branch == "SPARTA_F":
+                            threshold_line = th_f
+                        elif th_c is not None or th_f is not None:
+                            threshold_line = max([v for v in [th_c, th_f] if v is not None])
+
+                        st.pyplot(build_person_score_figure(df, threshold=threshold_line), use_container_width=True)
+                        st.success(f"✅ Scores: {scores_path.name}")
+
+                        with open(scores_path, "rb") as handle:
+                            st.download_button(
+                                "⬇️ Download Scores CSV",
+                                data=handle.read(),
+                                file_name=scores_path.name,
+                                mime="text/csv",
+                                use_container_width=True,
+                            )
+
+                        if source_mode == "Upload Video" and save_video and isinstance(video_path, Path):
+                            try:
+                                from visulation import overlay_predictions_on_video
+                                overlay_output_path = Path(run_cfg["paths"]["pose_output_dir"]) / f"overlay_{sparta_branch.lower()}_{source_stem or 'video'}.mp4"
+                                with st.spinner("Generating anomaly overlay video..."):
+                                    overlay_predictions_on_video(
+                                        video_path=video_path,
+                                        pose_json_path=final_json_path,
+                                        scores_csv_path=scores_path,
+                                        output_path=overlay_output_path,
+                                        segment_length=BASE_CFG.get("models", {}).get("sparta", {}).get("seg_len", 24),
+                                    )
+                                if overlay_output_path.exists():
+                                    st.subheader("🎬 Final Anomaly Overlay")
+                                    st.video(str(overlay_output_path))
+                                    with open(overlay_output_path, "rb") as vid_handle:
+                                        st.download_button(
+                                            "⬇️ Download Overlay Video",
+                                            data=vid_handle.read(),
+                                            file_name=overlay_output_path.name,
+                                            mime="video/mp4",
+                                            use_container_width=True,
+                                        )
+                            except Exception as overlay_error:
+                                st.warning(f"Overlay video generation skipped: {overlay_error}")
                 else:
                     st.warning("⚠️ Pose JSON not found; skipping anomaly scoring.")
                     
