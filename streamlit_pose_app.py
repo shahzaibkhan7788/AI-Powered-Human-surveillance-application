@@ -12,8 +12,7 @@ from pathlib import Path
 from typing import Any, Dict, Tuple
 
 # Local pipeline imports
-# Lazy import PosePipeline (moved into the button handler) to avoid
-# heavy/long imports on process startup (Hugging Face Spaces timeout issues).
+from PoseEstimationModel.pose_estimation import Config, PosePipeline
 
 
 BASE_DIR = Path(__file__).parent
@@ -567,40 +566,31 @@ def main():
                 progress_bar = st.progress(0)
                 status_text = st.empty()
                 
-                # Lazy-import the pose pipeline here so app UI can load quickly
-                # (some environments time out or fail if heavy ML libs import at module-level).
+                pipeline = PosePipeline(tmp_path)
+                final_json_path = None
+                
                 try:
-                    from PoseEstimationModel.pose_estimation import Config, PosePipeline
+                    frame_count = 0
+                    for frame, frame_id, total in pipeline.run_live():
+                        # Convert BGR to RGB
+                        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                        frame_placeholder.image(frame_rgb, channels="RGB")
+                        
+                        frame_count += 1
+                        if total > 0 and frame_count % 50 == 0:
+                            progress_bar.progress(min((frame_id + 1) / total, 1.0))
+                    
+                    progress_bar.progress(1.0)
+                    status_text.success(f"✅ Processing Complete: {frame_count} frames processed")
+                    
+                    # Get JSON path
+                    res_prefix = run_cfg["paths"]["static_prefix"]
+                    expected_json_name = get_expected_name(source_stem or "camera0", res_prefix) + run_cfg["paths"]["pose_json_suffix"]
+                    final_json_path = Path(run_cfg["paths"]["pose_output_dir"]) / expected_json_name
+                
                 except Exception as e:
-                    st.error(f"Failed to import pose pipeline: {e}")
-                    status_text.error(traceback.format_exc())
-                    final_json_path = None
-                else:
-                    pipeline = None
-                    final_json_path = None
-                    try:
-                        pipeline = PosePipeline(tmp_path)
-                        frame_count = 0
-                        for frame, frame_id, total in pipeline.run_live():
-                            # Convert BGR to RGB
-                            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                            frame_placeholder.image(frame_rgb, channels="RGB")
-
-                            frame_count += 1
-                            if total > 0 and frame_count % 50 == 0:
-                                progress_bar.progress(min((frame_id + 1) / total, 1.0))
-
-                        progress_bar.progress(1.0)
-                        status_text.success(f"✅ Processing Complete: {frame_count} frames processed")
-
-                        # Get JSON path
-                        res_prefix = run_cfg["paths"]["static_prefix"]
-                        expected_json_name = get_expected_name(source_stem or "camera0", res_prefix) + run_cfg["paths"]["pose_json_suffix"]
-                        final_json_path = Path(run_cfg["paths"]["pose_output_dir"]) / expected_json_name
-
-                    except Exception as e:
-                        st.error(f"❌ Processing Error: {str(e)}")
-                        status_text.error(f"Details: {traceback.format_exc()}")
+                    st.error(f"❌ Processing Error: {str(e)}")
+                    status_text.error(f"Details: {traceback.format_exc()}")
 
                 # --- ANOMALY SCORING ---
                 st.divider()
